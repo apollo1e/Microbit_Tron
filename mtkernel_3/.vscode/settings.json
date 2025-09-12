@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "tkernel.h": "c",
+        "tmonitor.h": "c",
+        "syscall.h": "c",
+        "syslib.h": "c",
+        "profile.h": "c",
+        "typedef.h": "c",
+        "machine.h": "c",
+        "config.h": "c",
+        "radio_config.h": "c",
+        "radio_driver.h": "c",
+        "stdint.h": "c"
+    }
+}
