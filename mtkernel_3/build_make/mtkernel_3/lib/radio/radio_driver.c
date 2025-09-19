@@ -1,273 +1,348 @@
 #include <tk/tkernel.h>
 #include <tm/tmonitor.h>
+#include <tstdlib.h>
+#include <stdint.h>
+#include "radio_driver.h"
 
-typedef unsigned char  uint8_t;
-typedef signed char    int8_t;
-typedef unsigned int   uint32_t;
-typedef int            bool;
+/* Nordic device headers (CMSIS) */
+#include <nrf.h>
+#include <tk/device.h>
+#include <tk/syslib.h>                /* EnableInt/DisableInt, tk_def_int */
 
-#define true 1
-#define false 0
+/* ---- Route the RADIO vector to μT-Kernel external interrupt dispatcher ---- */
+extern void Excep_Interrupt(void);    /* provided by μT-Kernel */
+void Excep_RADIO(void) { Excep_Interrupt(); }
 
-// Constants for radio configuration
-#define MICROBIT_RADIO_BASE_ADDRESS  0x75626974
-#define MICROBIT_RADIO_GROUP         1
-#define MICROBIT_RADIO_MAX_PACKET    32
+/* μT-Kernel external interrupt number for RADIO (Cortex-M: IRQn + 16) */
+#define RADIO_INTNO (16 + RADIO_IRQn)
 
-#define NRF_RADIO_BASE   0x40001000
-#define NRF_CLOCK_BASE   0x40000000
+/* --- minimal memcpy to avoid pulling in newlib <string.h> (size_t clash) --- */
+static void *memcpy_local(void *dst, const void *src, SZ n)
+{
+    unsigned char *d = (unsigned char*)dst;
+    const unsigned char *s = (const unsigned char*)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+#define memcpy memcpy_local
 
-#define NRF_RADIO        ((NRF_RADIO_Type *)NRF_RADIO_BASE)
-#define NRF_CLOCK        ((NRF_CLOCK_Type *)NRF_CLOCK_BASE)
+#ifndef __INLINE
+#define __INLINE static inline
+#endif
 
-volatile int last_rssi = 0;
-volatile bool packet_received = false;
+/* ------- Configurable limits (DAL typical MTU ~32 bytes) ------- */
+#define RADIO_MAX_PAYLOAD   32
+#define RX_QUEUE_DEPTH      4
 
-// Minimal type definitions for needed peripherals
+/* ------- μT-Kernel sync primitives ------- */
+static ID rx_sem = 0;  /* counts queued RX packets */
+
+/* ------- Simple RX ring ------- */
 typedef struct {
-    uint32_t TASKS_HFCLKSTART;
-    uint32_t TASKS_HFCLKSTOP;
-    uint32_t RESERVED0[62];
-    uint32_t EVENTS_HFCLKSTARTED;
-} NRF_CLOCK_Type;
-
-typedef struct {
-    uint32_t TASKS_TXEN;
-    uint32_t TASKS_RXEN;
-    uint32_t TASKS_START;
-    uint32_t TASKS_STOP;
-    uint32_t TASKS_DISABLE;
-    uint32_t RESERVED0[59];
-    uint32_t EVENTS_READY;
-    uint32_t EVENTS_END;
-    uint32_t EVENTS_DISABLED;
-    uint32_t RESERVED1[125];
-    uint32_t SHORTS;
-    uint32_t INTENSET;
-    uint32_t INTENCLR;
-    uint32_t CRCSTATUS;
-    uint32_t RXMATCH;
-    uint32_t RXCRC;
-    uint32_t DAI;
-    uint32_t PACKETPTR;
-    uint32_t FREQUENCY;
-    uint32_t TXPOWER;
-    uint32_t MODE;
-    uint32_t PCNF0;
-    uint32_t PCNF1;
-    uint32_t BASE0;
-    uint32_t BASE1;
-    uint32_t PREFIX0;
-    uint32_t PREFIX1;
-    uint32_t TXADDRESS;
-    uint32_t RXADDRESSES;
-    uint32_t CRCINIT;
-    uint32_t CRCPOLY;
-    uint32_t CRCCNF;
-    uint32_t TEST;
-    uint32_t TIFS;
-    uint32_t RSSISAMPLE;
-    // More fields omitted
-
-    uint32_t RESERVED2[40];  // Add this line
-    uint32_t STATE;          // Add this line
-
-
-} NRF_RADIO_Type;
-
-// Packet structure for micro:bit custom radio
-typedef struct FrameBuffer {
-    uint8_t length;
-    uint8_t version;
-    uint8_t group;
-    uint8_t protocol;
-    uint8_t payload[MICROBIT_RADIO_MAX_PACKET];
+    uint8_t len;
+    uint8_t data[RADIO_MAX_PAYLOAD];
     int8_t  rssi;
-} FrameBuffer;
+} rx_pkt_t;
 
-// Global buffers (aligned for DMA use)
-static FrameBuffer rx_buf __attribute__((aligned(4)));
-static FrameBuffer tx_buf __attribute__((aligned(4)));
-static FrameBuffer received_frame;
+static volatile rx_pkt_t rxq[RX_QUEUE_DEPTH];
+static volatile uint8_t  rx_head = 0, rx_tail = 0;
 
-// Call once at startup on both sender and receiver
-EXPORT void radio_init(void) {
-    // Start high frequency clock needed for radio
+/* Current settings (reflect DAL semantics) */
+static volatile uint8_t g_group  = RADIO_DEFAULT_GROUP;
+static volatile uint8_t g_band   = RADIO_DEFAULT_BAND;
+static volatile uint8_t g_txpwr  = RADIO_DEFAULT_TXPOWER;
+
+/* Forward decls of driver entry points */
+static ER radio_open(ID devid, UINT omode, void *exinf);
+static ER radio_close(ID devid, UINT option, void *exinf);
+static ER radio_exec(T_DEVREQ *req, TMO tmout, void *exinf);
+static ER radio_event(ID devid, INT evttyp, void *evtinf);
+
+/* ------------- Tiny helpers ------------- */
+static __INLINE void hfclk_start(void)
+{
+    /* Ensure HFCLK (32 MHz) is running for radio accuracy. */
     NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
     NRF_CLOCK->TASKS_HFCLKSTART = 1;
-    while (!NRF_CLOCK->EVENTS_HFCLKSTARTED);
+    while (NRF_CLOCK->EVENTS_HFCLKSTARTED == 0) { /* wait */ }
+}
 
-    // Enable RADIO interrupt (IRQ 1) and enable EVENTS_END interrupt
-    NRF_RADIO->INTENSET = (1 << 3);  // Bit 3 = EVENTS_END
-    *(volatile uint32_t *)0xE000E100 = (1 << 1); // Enable interrupt 1 in NVIC
+/* Map DAL band (0..100) -> NRF_RADIO->FREQUENCY (MHz offset from 2400) */
+static __INLINE uint32_t freq_from_band(uint8_t band)
+{
+    if (band > 100) band = 100;
+    return band; /* RADIO->FREQUENCY expects 0..100 meaning 2400+X MHz */
+}
 
-    // Configure basic radio settings
-    NRF_RADIO->TXPOWER   = 0x00;  // 0 dBm
-    NRF_RADIO->FREQUENCY = 7;     // Channel 7 = 2407 MHz
-    NRF_RADIO->MODE      = 1;     // 1 Mbps
+/* Use group as 8-bit PREFIX, with BASE chosen constant (privacy: same address space). */
+static void program_addressing(uint8_t group)
+{
+    /* All devices share address BASE; group maps to PREFIX[0]. Mirrors DAL "group" idea. */
+    NRF_RADIO->BASE0   = 0x75626974UL; /* ASCII 'ubit' (arbitrary but constant). */
+    NRF_RADIO->PREFIX0 = group;        /* 8-bit prefix = group id */
+    NRF_RADIO->TXADDRESS   = 0;        /* use address 0 for TX */
+    NRF_RADIO->RXADDRESSES = 1 << 0;   /* listen on address 0 */
+}
 
-    // Set base address and prefix
-    NRF_RADIO->BASE0 = MICROBIT_RADIO_BASE_ADDRESS;
-    NRF_RADIO->PREFIX0 = MICROBIT_RADIO_GROUP;
+/* Configure PHY, packet format (~32B payload), CRC16 */
+static void program_packet_config(void)
+{
+    /* 1 Mbps mode, whitening off by default. */
+    NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_1Mbit;
 
-    // Use logical address 0 for TX and RX
-    NRF_RADIO->TXADDRESS = 0;
-    NRF_RADIO->RXADDRESSES = 1;
+    /* Length field size = 8 bits, no S0/S1. */
+    NRF_RADIO->PCNF0 =
+        (0 << RADIO_PCNF0_S0LEN_Pos) |
+        (0 << RADIO_PCNF0_S1LEN_Pos) |
+        (8 << RADIO_PCNF0_LFLEN_Pos);
 
-    // Packet configuration
-    NRF_RADIO->PCNF0 = (8 << 0); // LFLEN = 8 bits
-    NRF_RADIO->PCNF1 = (1 << 25) | (4 << 16) | (MICROBIT_RADIO_MAX_PACKET << 0);
+    /* Max payload length 32, little endian, base address length 4 bytes, no whitening. */
+    NRF_RADIO->PCNF1 =
+        (4 << RADIO_PCNF1_BALEN_Pos) |
+        (RADIO_MAX_PAYLOAD << RADIO_PCNF1_MAXLEN_Pos) |
+        (0 << RADIO_PCNF1_STATLEN_Pos) |
+        (0 << RADIO_PCNF1_ENDIAN_Pos) |
+        (0 << RADIO_PCNF1_WHITEEN_Pos);
 
-    // CRC configuration
-    NRF_RADIO->CRCCNF  = 1;
+    /* CRC: 16-bit polynomial (0x1021), init 0xFFFF. */
+    NRF_RADIO->CRCCNF = RADIO_CRCCNF_LEN_Two;   /* 16-bit */
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->CRCPOLY = 0x11021;
-
-    // Enable SHORT: READY → START for automatic RX start
-    NRF_RADIO->SHORTS = (1 << 0);  // READY -> START
-
-    // Set RX buffer
-    NRF_RADIO->PACKETPTR = (uint32_t)&rx_buf;
-
-    // Start receiving
-    NRF_RADIO->TASKS_RXEN = 1;
-    while (!NRF_RADIO->EVENTS_READY);
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->TASKS_START = 1;
 }
 
-// Send data (blocking)
-EXPORT void radio_send(uint8_t *data, uint8_t length) {
-    if (length > MICROBIT_RADIO_MAX_PACKET) return;
-
-    // Fill the transmit buffer with header and payload
-    tx_buf.length = length + 3;  // Includes version, group, protocol
-    tx_buf.version = 1;
-    tx_buf.group = MICROBIT_RADIO_GROUP;
-    tx_buf.protocol = 1;
-    for (int i = 0; i < length; ++i)
-        tx_buf.payload[i] = data[i];
-
-    // --- Step 1: Ensure radio is in DISABLED state ---
-
-    tm_printf("DEBUG: Forcing radio to disable state...\n");
-
-    // Stop any ongoing operation just in case
-    NRF_RADIO->TASKS_STOP = 1;
-    tk_dly_tsk(1);  // Short wait to ensure STOP takes effect
-
-    // Reset all relevant event flags
-    NRF_RADIO->SHORTS = 0;
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->EVENTS_END = 0;
-    NRF_RADIO->EVENTS_DISABLED = 0;
-
-    // Send DISABLE command
-    NRF_RADIO->TASKS_DISABLE = 1;
-
-    // Wait until the radio is truly disabled (STATE == 0)
-    int timeout = 100000;
-    while ((NRF_RADIO->STATE != 0) && --timeout);
-    if (timeout <= 0) {
-        tm_printf("ERROR: Radio failed to enter DISABLED state!\n");
-        return;
-    }
-    tm_printf("DEBUG: Radio is now DISABLED\n");
-
-    // --- Step 2: Setup TX ---
-
-    NRF_RADIO->PACKETPTR = (uint32_t)&tx_buf;
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->EVENTS_END = 0;
-
-    // Start TX mode
-    tm_printf("DEBUG: Enabling TX mode...\n");
-    NRF_RADIO->TASKS_TXEN = 1;
-
-    // Wait until radio is ready
-    timeout = 100000;
-    while (!NRF_RADIO->EVENTS_READY && --timeout);
-    if (timeout <= 0) {
-        tm_printf("ERROR: TX READY TIMEOUT!\n");
-        return;
-    }
-    NRF_RADIO->EVENTS_READY = 0;
-
-    // Start transmission
-    tm_printf("DEBUG: Starting transmission...\n");
-    NRF_RADIO->TASKS_START = 1;
-
-    // Wait for TX to complete
-    timeout = 100000;
-    while (!NRF_RADIO->EVENTS_END && --timeout);
-    if (timeout <= 0) {
-        tm_printf("ERROR: TX END TIMEOUT!\n");
-        return;
-    }
-    NRF_RADIO->EVENTS_END = 0;
-
-    tm_printf("DEBUG: Transmission complete\n");
-
-    // --- Step 3: Return to RX mode ---
-
-    // Disable TX mode
-    NRF_RADIO->TASKS_DISABLE = 1;
-    timeout = 100000;
-    while ((NRF_RADIO->STATE != 0) && --timeout);
-    if (timeout <= 0) {
-        tm_printf("ERROR: Radio failed to DISABLE after TX!\n");
-        return;
-    }
-    NRF_RADIO->EVENTS_DISABLED = 0;
-
-    // Prepare RX mode
-    NRF_RADIO->PACKETPTR = (uint32_t)&rx_buf;
-    NRF_RADIO->EVENTS_READY = 0;
-
-    NRF_RADIO->TASKS_RXEN = 1;
-    timeout = 100000;
-    while (!NRF_RADIO->EVENTS_READY && --timeout);
-    if (timeout <= 0) {
-        tm_printf("ERROR: RXEN READY TIMEOUT!\n");
-        return;
-    }
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->TASKS_START = 1;
-
-    tm_printf("DEBUG: Returned to RX mode\n");
+/* TX power per DAL 0..7 ladder (map to closest NRF enum) */
+static void program_txpower(uint8_t pwr)
+{
+    static const int8_t map[8] = {
+        RADIO_TXPOWER_TXPOWER_Neg30dBm,
+        RADIO_TXPOWER_TXPOWER_Neg20dBm,
+        RADIO_TXPOWER_TXPOWER_Neg16dBm,
+        RADIO_TXPOWER_TXPOWER_Neg12dBm,
+        RADIO_TXPOWER_TXPOWER_Neg8dBm,
+        RADIO_TXPOWER_TXPOWER_Neg4dBm,
+        RADIO_TXPOWER_TXPOWER_0dBm,
+        RADIO_TXPOWER_TXPOWER_Pos4dBm
+    };
+    if (pwr > 7) pwr = 7;
+    NRF_RADIO->TXPOWER = map[pwr];
 }
 
+/* Start RX: program PACKETPTR and kick state machine */
+static uint8_t rx_buf[RADIO_MAX_PAYLOAD + 1]; /* byte 0 = length, rest = payload */
 
+static void radio_kick_rx(void)
+{
+    /* Prepare RX buffer: first byte is length (hardware places length there). */
+    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
 
-// Called in main loop to poll for received packet
-EXPORT int radio_receive(uint8_t *out_buf) {
-    if (!packet_received) return 0;
-
-    packet_received = false;
-
-    int payload_len = received_frame.length - 3;
-    if (payload_len > MICROBIT_RADIO_MAX_PACKET) payload_len = MICROBIT_RADIO_MAX_PACKET;
-
-    for (int i = 0; i < payload_len; i++)
-        out_buf[i] = received_frame.payload[i];
-
-    return payload_len;
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk
+                      | RADIO_SHORTS_END_START_Msk; /* auto-continue RX */
+    NRF_RADIO->EVENTS_READY = 0;
+    NRF_RADIO->EVENTS_END   = 0;
+    NRF_RADIO->TASKS_RXEN   = 1;
 }
 
-// RADIO IRQ handler (triggered on EVENTS_END)
-EXPORT void RADIO_IRQHandler(void) {
+/* Push one received packet into ring and post rx_sem */
+static void rxq_push(uint8_t *frame, uint8_t len, int8_t rssi)
+{
+    uint8_t next = (rx_head + 1) % RX_QUEUE_DEPTH;
+    if (next == rx_tail) {
+        /* overflow -> drop oldest */
+        rx_tail = (rx_tail + 1) % RX_QUEUE_DEPTH;
+    }
+    rxq[rx_head].len = (len > RADIO_MAX_PAYLOAD) ? RADIO_MAX_PAYLOAD : len;
+    memcpy((void*)rxq[rx_head].data, frame, rxq[rx_head].len);
+    rxq[rx_head].rssi = rssi;
+    rx_head = next;
+
+    /* This port doesn’t provide isig_sem; tk_sig_sem is allowed from handler here. */
+    (void)tk_sig_sem(rx_sem, 1);
+}
+
+/* μT-Kernel ISR (registered via tk_def_int/EnableInt) */
+static void radio_isr(UINT intno)
+{
+    (void)intno;
+
     if (NRF_RADIO->EVENTS_END) {
         NRF_RADIO->EVENTS_END = 0;
+
+        /* Good CRC? If so, queue. */
+        if ((NRF_RADIO->CRCSTATUS & RADIO_CRCSTATUS_CRCSTATUS_Msk) ==
+             RADIO_CRCSTATUS_CRCSTATUS_CRCOk) {
+            int8_t  rssi = (int8_t)NRF_RADIO->RSSISAMPLE;
+            uint8_t len  = rx_buf[0];
+            if (len > 0 && len <= RADIO_MAX_PAYLOAD) {
+                rxq_push(&rx_buf[1], len, rssi);
+            }
+        }
+        /* Ready for the next frame due to SHORTS (END->START). */
+    }
+}
+
+/* ------- μT-Kernel device entry points ------- */
+
+static ER radio_open(ID devid, UINT omode, void *exinf)
+{
+    (void)devid; (void)omode; (void)exinf;
+
+    /* Create RX semaphore once */
+    if (rx_sem == 0) {
+        T_CSEM csem = {0};
+        csem.sematr = TA_TPRI;  /* prioritize tasks waiting on sem */
+        csem.isemcnt = 0;
+        csem.maxsem  = RX_QUEUE_DEPTH;
+        rx_sem = tk_cre_sem(&csem);
+    }
+
+    /* Clock and basic radio config */
+    hfclk_start();
+    NRF_RADIO->EVENTS_DISABLED = 0;
+    NRF_RADIO->TASKS_DISABLE = 1;
+    while (NRF_RADIO->EVENTS_DISABLED == 0) {}
+
+    program_packet_config();
+    program_txpower(g_txpwr);
+    NRF_RADIO->FREQUENCY = freq_from_band(g_band);
+    program_addressing(g_group);
+
+    /* Enable radio interrupt via μT-Kernel */
+    NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk;
+
+    T_DINT dint = (T_DINT){0};
+    dint.inthdr = (FP)radio_isr;
+    tk_def_int(RADIO_INTNO, &dint);
+    EnableInt(RADIO_INTNO, 3);   /* pick a reasonable priority for your port */
+
+    /* Start RX loop */
+    radio_kick_rx();
+
+    return E_OK;
+}
+
+static ER radio_close(ID devid, UINT option, void *exinf)
+{
+    (void)devid; (void)option; (void)exinf;
+
+    DisableInt(RADIO_INTNO);
+    NRF_RADIO->INTENCLR = 0xFFFFFFFF;
+    NRF_RADIO->SHORTS = 0;
+    NRF_RADIO->EVENTS_DISABLED = 0;
+    NRF_RADIO->TASKS_DISABLE = 1;
+    while (NRF_RADIO->EVENTS_DISABLED == 0) {}
+    return E_OK;
+}
+
+/* Handle READ/WRITE requests:
+   - READ: waits on rx_sem, then copies out one queued frame.
+   - WRITE: transmits the buffer and waits for END, then returns to RX.
+*/
+static ER radio_exec(T_DEVREQ *req, TMO tmout, void *exinf)
+{
+    (void)exinf;
+
+    switch (req->cmd) {
+    case TDC_READ: {
+        /* Wait for a packet */
+        ER er = tk_wai_sem(rx_sem, 1, tmout);
+        if (er < E_OK) { req->asize = 0; return er; }
+
+        /* Pop from ring */
+        if (rx_tail == rx_head) { req->asize = 0; return E_OK; }
+        uint8_t idx = rx_tail;
+        rx_tail = (rx_tail + 1) % RX_QUEUE_DEPTH;
+
+        /* Copy out, truncating to caller buffer size */
+        SZ tocpy = (rxq[idx].len <= req->size) ? rxq[idx].len : req->size;
+        memcpy(req->buf, (const void*)rxq[idx].data, tocpy);
+        req->asize = tocpy;
+        return E_OK;
+    }
+
+    case TDC_WRITE: {
+        /* Copy into a TX frame: DAL length-prefixed format */
+        uint8_t local[RADIO_MAX_PAYLOAD + 1];
+        SZ len = (req->size > RADIO_MAX_PAYLOAD) ? RADIO_MAX_PAYLOAD : req->size;
+        local[0] = (uint8_t)len;
+        memcpy(&local[1], req->buf, len);
+
+        /* Disable RX, set PACKETPTR, TX, wait END, then re-enter RX. */
+        NRF_RADIO->SHORTS = 0;             /* stop auto RX */
+        NRF_RADIO->EVENTS_END = 0;
+        NRF_RADIO->PACKETPTR = (uint32_t)local;
+
+        NRF_RADIO->TASKS_DISABLE = 1;      /* ensure clean state */
+        while (NRF_RADIO->EVENTS_DISABLED == 0) {}
         NRF_RADIO->EVENTS_DISABLED = 0;
 
-        if (NRF_RADIO->CRCSTATUS == 1) {
-            last_rssi = -((int)NRF_RADIO->RSSISAMPLE);
-            received_frame = rx_buf;
-            packet_received = true;
-        }
+        NRF_RADIO->TASKS_TXEN = 1;
+        while (NRF_RADIO->EVENTS_READY == 0) {}
+        NRF_RADIO->EVENTS_READY = 0;
 
-        // Prepare for next reception
-        NRF_RADIO->PACKETPTR = (uint32_t)&rx_buf;
         NRF_RADIO->TASKS_START = 1;
+        while (NRF_RADIO->EVENTS_END == 0) {}
+        NRF_RADIO->EVENTS_END = 0;
+
+        /* Back to RX */
+        NRF_RADIO->EVENTS_DISABLED = 0;
+        NRF_RADIO->TASKS_DISABLE = 1;
+        while (NRF_RADIO->EVENTS_DISABLED == 0) {}
+        radio_kick_rx();
+
+        req->asize = len;
+        return E_OK;
     }
+
+    default:
+        req->asize = 0;
+        return E_PAR;
+    }
+}
+
+/* Not used in this simple driver, but provided to satisfy μT-Kernel device API. */
+static ER radio_event(ID devid, INT evttyp, void *evtinf)
+{
+    (void)devid; (void)evttyp; (void)evtinf;
+    return E_OK;
+}
+
+/* Public init: register the device name from radio_driver.h */
+void radio_driver_init(void)
+{
+    T_DDEV ddev = (T_DDEV){0};
+
+    ddev.exinf   = 0;
+    ddev.drvatr  = 0;
+    ddev.openfn  = (FP)radio_open;
+    ddev.closefn = (FP)radio_close;
+    ddev.execfn  = (FP)radio_exec;
+    ddev.waitfn  = NULL;
+    ddev.abortfn = NULL;
+    ddev.eventfn = (FP)radio_event;
+
+    tk_def_dev((UB*)RADIO_DEVNAME, &ddev, NULL);
+    tm_printf("[radio] registered '%s'\n", RADIO_DEVNAME);
+}
+
+/* ---- Runtime setters (mirror DAL) ---- */
+
+int radio_set_group(uint8_t group)
+{
+    g_group = group;
+    program_addressing(group);
+    return E_OK;
+}
+
+int radio_set_band(uint8_t band)
+{
+    g_band = (band > 100) ? 100 : band;
+    NRF_RADIO->FREQUENCY = freq_from_band(g_band);
+    return E_OK;
+}
+
+int radio_set_txpower(uint8_t power)
+{
+    g_txpwr = (power > 7) ? 7 : power;
+    program_txpower(g_txpwr);
+    return E_OK;
 }
