@@ -17,12 +17,7 @@ mtkernel_3/app_sample2/app_main.o: ../app_sample2/app_main.c \
  ../include/tk/syslib.h ../include/tk/sysdepend/microbit/syslib.h \
  ../include/tk/sysdepend/microbit/../cpu/nrf5/syslib.h \
  ../include/tk/sysdepend/microbit/../cpu/nrf5/../core/armv7m/syslib.h \
- ../include/tk/errno.h ../include/tm/tmonitor.h ../include/radio_driver.h \
- ../include/tk/device.h ../include/tk/../../device/include/device.h \
- ../config/config_device.h ../include/tk/../../device/include/dev_ser.h \
- ../include/tk/../../device/include/../ser/sysdepend/nrf5/ser_mode_nrf5.h \
- ../include/tk/../../device/include/dev_adc.h \
- ../include/tk/../../device/include/dev_i2c.h
+ ../include/tk/errno.h ../include/tm/tmonitor.h ../include/radio_driver.h
 ../include/tk/tkernel.h:
 ../include/sys/machine.h:
 ../config/config.h:
@@ -53,10 +48,3 @@ mtkernel_3/app_sample2/app_main.o: ../app_sample2/app_main.c \
 ../include/tk/errno.h:
 ../include/tm/tmonitor.h:
 ../include/radio_driver.h:
-../include/tk/device.h:
-../include/tk/../../device/include/device.h:
-../config/config_device.h:
-../include/tk/../../device/include/dev_ser.h:
-../include/tk/../../device/include/../ser/sysdepend/nrf5/ser_mode_nrf5.h:
-../include/tk/../../device/include/dev_adc.h:
-../include/tk/../../device/include/dev_i2c.h:
