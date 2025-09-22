@@ -13,8 +13,17 @@
 extern void Excep_Interrupt(void);    /* provided by μT-Kernel */
 void Excep_RADIO(void) { Excep_Interrupt(); }
 
+
 /* μT-Kernel external interrupt number for RADIO (Cortex-M: IRQn + 16) */
 #define RADIO_INTNO (16 + RADIO_IRQn)
+
+
+volatile uint32_t g_evt_end = 0;
+volatile uint32_t g_crc_ok  = 0;
+volatile uint32_t g_crc_bad = 0;
+volatile uint8_t  g_last_len = 0;
+volatile int8_t   g_last_rssi = 0;
+
 
 /* --- minimal memcpy to avoid pulling in newlib <string.h> (size_t clash) --- */
 static void *memcpy_local(void *dst, const void *src, SZ n)
@@ -102,7 +111,9 @@ static void program_packet_config(void)
         (RADIO_MAX_PAYLOAD << RADIO_PCNF1_MAXLEN_Pos) |
         (0 << RADIO_PCNF1_STATLEN_Pos) |
         (0 << RADIO_PCNF1_ENDIAN_Pos) |
-        (0 << RADIO_PCNF1_WHITEEN_Pos);
+        (1 << RADIO_PCNF1_WHITEEN_Pos);
+
+    NRF_RADIO->DATAWHITEIV = 0x18;           // <—— MATCH CODAL
 
     /* CRC: 16-bit polynomial (0x1021), init 0xFFFF. */
     NRF_RADIO->CRCCNF = RADIO_CRCCNF_LEN_Two;   /* 16-bit */
@@ -160,27 +171,94 @@ static void rxq_push(uint8_t *frame, uint8_t len, int8_t rssi)
 }
 
 /* μT-Kernel ISR (registered via tk_def_int/EnableInt) */
+// static void radio_isr(UINT intno)
+// {
+//     (void)intno;
+
+//     if (NRF_RADIO->EVENTS_END) {
+//         NRF_RADIO->EVENTS_END = 0;
+
+//         /* Good CRC? If so, queue. */
+//         if ((NRF_RADIO->CRCSTATUS & RADIO_CRCSTATUS_CRCSTATUS_Msk) ==
+//              RADIO_CRCSTATUS_CRCSTATUS_CRCOk) {
+//             int8_t  rssi = (int8_t)NRF_RADIO->RSSISAMPLE;
+//             uint8_t len  = rx_buf[0];
+//             if (len > 0 && len <= RADIO_MAX_PAYLOAD) {
+//                 rxq_push(&rx_buf[1], len, rssi);
+//             }
+//         }
+//         /* Ready for the next frame due to SHORTS (END->START). */
+//     }
+// }
+
+
 static void radio_isr(UINT intno)
 {
     (void)intno;
 
     if (NRF_RADIO->EVENTS_END) {
         NRF_RADIO->EVENTS_END = 0;
+        g_evt_end++;
 
-        /* Good CRC? If so, queue. */
-        if ((NRF_RADIO->CRCSTATUS & RADIO_CRCSTATUS_CRCSTATUS_Msk) ==
-             RADIO_CRCSTATUS_CRCSTATUS_CRCOk) {
-            int8_t  rssi = (int8_t)NRF_RADIO->RSSISAMPLE;
-            uint8_t len  = rx_buf[0];
-            if (len > 0 && len <= RADIO_MAX_PAYLOAD) {
-                rxq_push(&rx_buf[1], len, rssi);
-            }
+        int ok = (NRF_RADIO->CRCSTATUS & RADIO_CRCSTATUS_CRCSTATUS_Msk)
+                  == RADIO_CRCSTATUS_CRCSTATUS_CRCOk;
+
+        uint8_t len = rx_buf[0];
+        g_last_len = len;
+        g_last_rssi = (int8_t)NRF_RADIO->RSSISAMPLE;
+
+        if (ok) {
+            g_crc_ok++;
+            if (len > 0 && len <= RADIO_MAX_PAYLOAD)
+                rxq_push(&rx_buf[1], len, g_last_rssi);
+        } else {
+            g_crc_bad++;
         }
-        /* Ready for the next frame due to SHORTS (END->START). */
+        /* RX continues via SHORTS END->START */
     }
 }
 
+
 /* ------- μT-Kernel device entry points ------- */
+
+// static ER radio_open(ID devid, UINT omode, void *exinf)
+// {
+//     (void)devid; (void)omode; (void)exinf;
+
+//     /* Create RX semaphore once */
+//     if (rx_sem == 0) {
+//         T_CSEM csem = {0};
+//         csem.sematr = TA_TPRI;  /* prioritize tasks waiting on sem */
+//         csem.isemcnt = 0;
+//         csem.maxsem  = RX_QUEUE_DEPTH;
+//         rx_sem = tk_cre_sem(&csem);
+//     }
+
+//     /* Clock and basic radio config */
+//     hfclk_start();
+//     NRF_RADIO->EVENTS_DISABLED = 0;
+//     NRF_RADIO->TASKS_DISABLE = 1;
+//     while (NRF_RADIO->EVENTS_DISABLED == 0) {}
+
+//     program_packet_config();
+//     program_txpower(g_txpwr);
+//     NRF_RADIO->FREQUENCY = freq_from_band(g_band);
+//     program_addressing(g_group);
+
+   
+//     /* Enable radio interrupt via μT-Kernel */
+//     NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk;
+
+//     T_DINT dint = (T_DINT){0};
+//     dint.inthdr = (FP)radio_isr;
+//     tk_def_int(RADIO_INTNO, &dint);
+//     EnableInt(RADIO_INTNO, 3);   /* pick a reasonable priority for your port */
+
+//     /* Start RX loop */
+//     radio_kick_rx();
+
+//     return E_OK;
+// }
 
 static ER radio_open(ID devid, UINT omode, void *exinf)
 {
@@ -189,7 +267,7 @@ static ER radio_open(ID devid, UINT omode, void *exinf)
     /* Create RX semaphore once */
     if (rx_sem == 0) {
         T_CSEM csem = {0};
-        csem.sematr = TA_TPRI;  /* prioritize tasks waiting on sem */
+        csem.sematr = TA_TPRI;
         csem.isemcnt = 0;
         csem.maxsem  = RX_QUEUE_DEPTH;
         rx_sem = tk_cre_sem(&csem);
@@ -197,28 +275,60 @@ static ER radio_open(ID devid, UINT omode, void *exinf)
 
     /* Clock and basic radio config */
     hfclk_start();
+
+    /* Ensure radio is fully disabled before (re)config */
     NRF_RADIO->EVENTS_DISABLED = 0;
-    NRF_RADIO->TASKS_DISABLE = 1;
+    NRF_RADIO->TASKS_DISABLE   = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0) {}
+    NRF_RADIO->EVENTS_DISABLED = 0;
 
     program_packet_config();
     program_txpower(g_txpwr);
     NRF_RADIO->FREQUENCY = freq_from_band(g_band);
     program_addressing(g_group);
 
+    /* Debug: dump config */
+    tm_printf("[cfg] MODE=%08lx PCNF0=%08lx PCNF1=%08lx\n",
+        NRF_RADIO->MODE, NRF_RADIO->PCNF0, NRF_RADIO->PCNF1);
+    tm_printf("[cfg] CRC: CNF=%08lx INIT=%08lx POLY=%08lx\n",
+        NRF_RADIO->CRCCNF, NRF_RADIO->CRCINIT, NRF_RADIO->CRCPOLY);
+    tm_printf("[cfg] ADDR: BASE0=%08lx PREFIX0=%08lx TXADDR=%lu RXADDR=%08lx BALEN=%lu\n",
+        NRF_RADIO->BASE0, NRF_RADIO->PREFIX0, (unsigned long)NRF_RADIO->TXADDRESS,
+        NRF_RADIO->RXADDRESSES,
+        (unsigned long)((NRF_RADIO->PCNF1 >> RADIO_PCNF1_BALEN_Pos) & 7));
+    tm_printf("[cfg] FREQ=%lu WHITEEN=%lu IV=%lu SHORTS=%08lx\n",
+        (unsigned long)NRF_RADIO->FREQUENCY,
+        (unsigned long)((NRF_RADIO->PCNF1 >> RADIO_PCNF1_WHITEEN_Pos) & 1),
+        (unsigned long)NRF_RADIO->DATAWHITEIV,
+        NRF_RADIO->SHORTS);
+    tm_printf("[cfg] RADIO_IRQn=%d RADIO_INTNO=%d\n", RADIO_IRQn, RADIO_INTNO);
+
     /* Enable radio interrupt via μT-Kernel */
+    NRF_RADIO->INTENCLR = 0xFFFFFFFF;
     NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk;
 
-    T_DINT dint = (T_DINT){0};
+    T_DINT dint = {0};
     dint.inthdr = (FP)radio_isr;
     tk_def_int(RADIO_INTNO, &dint);
-    EnableInt(RADIO_INTNO, 3);   /* pick a reasonable priority for your port */
+    EnableInt(RADIO_INTNO, 2);   /* choose a sensible priority for your port */
 
-    /* Start RX loop */
-    radio_kick_rx();
+    /* ---- Start RX loop (explicit first START) ---- */
+    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf; /* byte 0 = length */
+    NRF_RADIO->SHORTS    = RADIO_SHORTS_READY_START_Msk
+                         | RADIO_SHORTS_END_START_Msk; /* auto-continue RX */
+
+    NRF_RADIO->EVENTS_READY = 0;
+    NRF_RADIO->EVENTS_END   = 0;
+
+    NRF_RADIO->TASKS_RXEN   = 1;
+    while (NRF_RADIO->EVENTS_READY == 0) { /* wait once on boot */ }
+    NRF_RADIO->EVENTS_READY = 0;
+
+    NRF_RADIO->TASKS_START  = 1;  /* explicit first START */
 
     return E_OK;
 }
+
 
 static ER radio_close(ID devid, UINT option, void *exinf)
 {

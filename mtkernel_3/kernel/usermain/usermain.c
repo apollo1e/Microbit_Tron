@@ -14,6 +14,8 @@
 #include <tk/tkernel.h>
 #include <tm/tmonitor.h>
 
+extern void radio_driver_init(void);   // add this
+
 /*
  * Entry routine for the user application.
  * At this point, Initialize and start the user application.
@@ -29,5 +31,9 @@
 
 WEAK_FUNC EXPORT INT	usermain( void )
 {
+	tm_printf("[usermain] start ... \n");
+
+	radio_driver_init();               // register /dev/radio early
+
 	return 0;
 }

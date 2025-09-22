@@ -6,7 +6,7 @@
 # EXE_FILE := mtkernel_3_button_switch55
 .DEFAULT_GOAL := all
 
-EXE_FILE := receiver_v1
+EXE_FILE := receiver_v2
 
 # Specify only one target name
 #TARGET := _IOTE_M367_

@@ -8,7 +8,7 @@
 
 /* Defaults (mirrors micro:bit runtime behavior: 1 Mbps, ~32B MTU, band 7 ≈ 2407 MHz) */
 #define RADIO_DEFAULT_BAND      7    /* 0..100 -> 2400 + band MHz (DAL uses 2407 MHz typical). */
-#define RADIO_DEFAULT_GROUP     0    /* micro:bit default group is 0. */
+#define RADIO_DEFAULT_GROUP     1    /* micro:bit default group is 0. */
 #define RADIO_DEFAULT_TXPOWER   0    /* 0..7 per docs; 0 ≈ lowest, 7 ≈ highest. */
 
 /* Driver init: registers the device and sets sane defaults. Call once from usermain(). */
